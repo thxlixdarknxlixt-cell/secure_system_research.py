@@ -1,0 +1,200 @@
+import os
+import json
+import time
+import random
+import hashlib
+import logging
+import argparse
+from dataclasses import dataclass, asdict
+from datetime import datetime
+
+import numpy as np
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+
+# ==========================================================
+# 1. Configuration
+# ==========================================================
+
+@dataclass
+class ExperimentConfig:
+    seed: int = 42
+    n_samples: int = 1000
+    anomaly_ratio: float = 0.05
+    contamination: float = 0.05
+    optimization_steps: int = 20
+    learning_rate: float = 0.01
+    output_dir: str = "results"
+
+
+# ==========================================================
+# 2. Utilities
+# ==========================================================
+
+def set_global_seed(seed: int):
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def generate_run_id(config: ExperimentConfig):
+    config_string = json.dumps(asdict(config), sort_keys=True)
+    return hashlib.md5(config_string.encode()).hexdigest()[:10]
+
+
+def setup_logging(run_dir):
+    log_path = os.path.join(run_dir, "experiment.log")
+    logging.basicConfig(
+        filename=log_path,
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+
+# ==========================================================
+# 3. Data Module
+# ==========================================================
+
+class DataModule:
+    def __init__(self, config: ExperimentConfig):
+        self.config = config
+        self.scaler = StandardScaler()
+
+    def generate(self):
+        n = self.config.n_samples
+        ratio = self.config.anomaly_ratio
+
+        normal = np.random.normal(0, 1, (n, 5))
+        anomalies = np.random.uniform(5, 8, (int(n * ratio), 5))
+
+        X = np.vstack([normal, anomalies])
+        y = np.array([0] * n + [1] * int(n * ratio))
+
+        X = self.scaler.fit_transform(X)
+        return X, y
+
+
+# ==========================================================
+# 4. Model Module
+# ==========================================================
+
+class SecurityModel:
+    def __init__(self, config: ExperimentConfig):
+        self.config = config
+        self.model = IsolationForest(
+            contamination=config.contamination,
+            random_state=config.seed
+        )
+
+    def train(self, X):
+        self.model.fit(X)
+
+    def optimize(self, X):
+        for _ in range(self.config.optimization_steps):
+            new_contamination = max(
+                0.001,
+                self.model.contamination * (1 - self.config.learning_rate)
+            )
+            self.model.set_params(contamination=new_contamination)
+            self.model.fit(X)
+
+    def predict(self, X):
+        preds = self.model.predict(X)
+        return np.where(preds == -1, 1, 0)
+
+
+# ==========================================================
+# 5. Metrics Module
+# ==========================================================
+
+def compute_metrics(y_true, y_pred):
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1_score": f1_score(y_true, y_pred),
+    }
+
+
+# ==========================================================
+# 6. Experiment Runner
+# ==========================================================
+
+class ExperimentRunner:
+    def __init__(self, config: ExperimentConfig):
+        self.config = config
+        set_global_seed(config.seed)
+
+        self.run_id = generate_run_id(config)
+        self.run_dir = os.path.join(config.output_dir, self.run_id)
+        os.makedirs(self.run_dir, exist_ok=True)
+
+        setup_logging(self.run_dir)
+
+        logging.info("Experiment initialized")
+        logging.info(f"Config: {asdict(config)}")
+
+    def run(self):
+        start_time = time.time()
+
+        # Data
+        data_module = DataModule(self.config)
+        X, y = data_module.generate()
+
+        # Model
+        model = SecurityModel(self.config)
+        model.train(X)
+        model.optimize(X)
+        y_pred = model.predict(X)
+
+        # Metrics
+        metrics = compute_metrics(y, y_pred)
+
+        end_time = time.time()
+        metrics["runtime_seconds"] = end_time - start_time
+
+        # Save results
+        self.save_results(metrics)
+
+        logging.info(f"Metrics: {metrics}")
+        print("Experiment Complete")
+        print(json.dumps(metrics, indent=4))
+
+    def save_results(self, metrics):
+        with open(os.path.join(self.run_dir, "metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=4)
+
+        with open(os.path.join(self.run_dir, "config.json"), "w") as f:
+            json.dump(asdict(self.config), f, indent=4)
+
+
+# ==========================================================
+# 7. CLI Interface
+# ==========================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Reproducible Security Experiment")
+    parser.add_argument("--samples", type=int, default=1000)
+    parser.add_argument("--anomaly_ratio", type=float, default=0.05)
+    parser.add_argument("--contamination", type=float, default=0.05)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    config = ExperimentConfig(
+        seed=args.seed,
+        n_samples=args.samples,
+        anomaly_ratio=args.anomaly_ratio,
+        contamination=args.contamination,
+    )
+
+    runner = ExperimentRunner(config)
+    runner.run()
+
+
+if __name__ == "__main__":
+    main()
